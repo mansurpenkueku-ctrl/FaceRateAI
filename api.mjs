@@ -16,8 +16,16 @@ function publicUser(u){return {id:u.id,email:u.email,createdAt:u.createdAt,entit
 function activeEntitlement(u){const e=u.entitlement||{plan:"free",expiresAt:null};if(e.expiresAt&&e.expiresAt!=="lifetime"&&Date.parse(e.expiresAt)<=Date.now())return {plan:"free",expiresAt:null};return e}
 function hashPassword(pass,salt){return crypto.scryptSync(pass,salt,64).toString("hex")}
 function verifyPassword(pass,u){const got=Buffer.from(hashPassword(pass,u.salt),"hex"),want=Buffer.from(u.passwordHash,"hex");return got.length===want.length&&crypto.timingSafeEqual(got,want)}
-function issue(payload){return {headers:{"Set-Cookie":cookie(makeToken({...payload,exp:Date.now()+7*86400000}))}}}
-export default async (event)=>{
+function issue(payload){
+  return {
+    "Set-Cookie": cookie(
+      makeToken({
+        ...payload,
+        exp: Date.now() + 7 * 86400000
+      })
+    )
+  };
+}
  if(event.httpMethod==="OPTIONS")return response(204,{});
  const path=event.path.split("/").pop();
  let body={};try{body=event.body?JSON.parse(event.body):{}}catch{return response(400,{error:"Некорректный JSON"})}
