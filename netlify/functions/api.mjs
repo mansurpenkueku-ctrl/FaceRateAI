@@ -26,6 +26,7 @@ function issue(payload){
     )
   };
 }
+export default async function handler(event){
  if(event.httpMethod==="OPTIONS")return response(204,{});
  const path=event.path.split("/").pop();
  let body={};try{body=event.body?JSON.parse(event.body):{}}catch{return response(400,{error:"Некорректный JSON"})}
@@ -67,4 +68,4 @@ function issue(payload){
   }
   return response(404,{error:"Маршрут не найден"});
  }catch(e){console.error(e);return response(500,{error:"Внутренняя ошибка сервера"})}
-};
+}
