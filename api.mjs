@@ -3,55 +3,75 @@ import crypto from "node:crypto";
 
 const store = getStore("facerate-users");
 const COOKIE = "fr_session";
-const secret = () => process.env.SESSION_SECRET || "";
-const b64 = s => Buffer.from(s).toString("base64url");
-const sign = s => crypto.createHmac("sha256", secret()).update(s).digest("base64url");
 
-function makeToken(payload) {
-  const p = b64(JSON.stringify(payload));
-  return p + "." + sign(p);
+const secret = () => process.env.SESSION_SECRET || "";
+
+function sign(value) {
+  return crypto.createHmac("sha256", secret())
+    .update(value)
+    .digest("base64url");
 }
 
-function readToken(event) {
-  const h = event.headers?.cookie || event.headers?.Cookie || "";
-  const raw = h.split(";").map(x => x.trim())
+function token(payload) {
+  const data = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  return data + "." + sign(data);
+}
+
+function getSession(event) {
+  const cookies = event.headers?.cookie || "";
+  const raw = cookies.split(";")
+    .map(x => x.trim())
     .find(x => x.startsWith(COOKIE + "="))
     ?.slice(COOKIE.length + 1);
 
-  if (!raw) return null;
-  const [p, s] = raw.split(".");
-  if (!p || !s || !secret()) return null;
+  if (!raw || !secret()) return null;
 
-  const expected = sign(p);
-  if (s.length !== expected.length ||
-      !crypto.timingSafeEqual(Buffer.from(s), Buffer.from(expected))) return null;
+  const [data, signature] = raw.split(".");
+  if (!data || !signature) return null;
+
+  const expected = sign(data);
+
+  if (
+    signature.length !== expected.length ||
+    !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))
+  ) return null;
 
   try {
-    const v = JSON.parse(Buffer.from(p, "base64url").toString());
-    if (v.exp < Date.now()) return null;
-    return v;
+    const session = JSON.parse(
+      Buffer.from(data, "base64url").toString()
+    );
+
+    if (session.exp < Date.now()) return null;
+    return session;
   } catch {
     return null;
   }
 }
 
-function cookie(value, maxAge = 604800) {
-  return `${COOKIE}=${value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
-}
-
-function response(status, body, headers = {}) {
+function reply(statusCode, data, headers = {}) {
   return {
-    statusCode: status,
+    statusCode,
     headers: {
-      "Content-Type": "application/json; charset=utf-8",
+      "Content-Type": "application/json",
       "Cache-Control": "no-store",
       ...headers
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify(data)
   };
 }
 
-async function allUsers() {
+function setCookie(payload) {
+  const value = token({
+    ...payload,
+    exp: Date.now() + 7 * 86400000
+  });
+
+  return {
+    "Set-Cookie": `${COOKIE}=${value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=604800`
+  };
+}
+
+async function getUsers() {
   return await store.get("users", { type: "json" }) || [];
 }
 
@@ -59,56 +79,54 @@ async function saveUsers(users) {
   await store.setJSON("users", users);
 }
 
-function publicUser(u) {
-  return {
-    id: u.id,
-    email: u.email,
-    createdAt: u.createdAt,
-    entitlement: activeEntitlement(u)
-  };
-}
+function entitlement(user) {
+  const e = user.entitlement || { plan: "free", expiresAt: null };
 
-function activeEntitlement(u) {
-  const e = u.entitlement || { plan: "free", expiresAt: null };
-  if (e.expiresAt && e.expiresAt !== "lifetime" &&
-      Date.parse(e.expiresAt) <= Date.now()) {
+  if (
+    e.expiresAt &&
+    e.expiresAt !== "lifetime" &&
+    Date.parse(e.expiresAt) <= Date.now()
+  ) {
     return { plan: "free", expiresAt: null };
   }
+
   return e;
 }
 
-function hashPassword(pass, salt) {
-  return crypto.scryptSync(pass, salt, 64).toString("hex");
-}
-
-function verifyPassword(pass, u) {
-  const got = Buffer.from(hashPassword(pass, u.salt), "hex");
-  const want = Buffer.from(u.passwordHash, "hex");
-  return got.length === want.length &&
-    crypto.timingSafeEqual(got, want);
-}
-
-function issue(payload) {
+function safeUser(user) {
   return {
-    "Set-Cookie": cookie(
-      makeToken({
-        ...payload,
-        exp: Date.now() + 7 * 86400000
-      })
-    )
+    id: user.id,
+    email: user.email,
+    createdAt: user.createdAt,
+    entitlement: entitlement(user)
   };
 }
 
-export default async function handler(event) {
-  if (event.httpMethod === "OPTIONS") return response(204, {});
+function hashPassword(password, salt) {
+  return crypto.scryptSync(password, salt, 64).toString("hex");
+}
 
-  const path = event.path.split("/").pop();
+function verifyPassword(password, user) {
+  const a = Buffer.from(hashPassword(password, user.salt), "hex");
+  const b = Buffer.from(user.passwordHash, "hex");
+
+  return a.length === b.length &&
+    crypto.timingSafeEqual(a, b);
+}
+
+export default async function handler(event) {
+  if (event.httpMethod === "OPTIONS") {
+    return reply(204, {});
+  }
+
+  const path = (event.path || "").split("/").pop();
+
   let body = {};
 
   try {
     body = event.body ? JSON.parse(event.body) : {};
   } catch {
-    return response(400, { error: "Некорректный JSON" });
+    return reply(400, { error: "Некорректный JSON" });
   }
 
   try {
@@ -117,119 +135,158 @@ export default async function handler(event) {
       const password = String(body.password || "");
 
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-        return response(400, { error: "Введите корректный email" });
+        return reply(400, { error: "Некорректный email" });
       }
 
-      let users = await allUsers();
-      let u = users.find(x => x.email === email);
+      let users = await getUsers();
+      let user = users.find(u => u.email === email);
 
       if (path === "register") {
         if (password.length < 8) {
-          return response(400, { error: "Пароль должен быть не короче 8 символов" });
+          return reply(400, { error: "Минимум 8 символов в пароле" });
         }
-        if (u) return response(409, { error: "Этот email уже зарегистрирован" });
+
+        if (user) {
+          return reply(409, { error: "Аккаунт уже существует" });
+        }
 
         const salt = crypto.randomBytes(16).toString("hex");
-        u = {
+
+        user = {
           id: crypto.randomUUID(),
           email,
           salt,
           passwordHash: hashPassword(password, salt),
           createdAt: new Date().toISOString(),
-          entitlement: { plan: "free", expiresAt: null }
+          entitlement: {
+            plan: "free",
+            expiresAt: null
+          }
         };
 
-        users.push(u);
+        users.push(user);
         await saveUsers(users);
-      } else if (!u || !verifyPassword(password, u)) {
-        return response(401, { error: "Неверный email или пароль" });
+
+      } else if (!user || !verifyPassword(password, user)) {
+        return reply(401, { error: "Неверный email или пароль" });
       }
 
-      return response(200, { user: publicUser(u) }, issue({ uid: u.id, role: "user" }));
+      return reply(
+        200,
+        { user: safeUser(user) },
+        setCookie({ uid: user.id, role: "user" })
+      );
     }
 
     if (path === "admin-login") {
-      if (!process.env.ADMIN_EMAIL ||
-          !process.env.ADMIN_PASSWORD ||
-          !secret()) {
-        return response(503, {
-          error: "Добавь ADMIN_EMAIL, ADMIN_PASSWORD и SESSION_SECRET в Netlify environment variables"
+      if (
+        !process.env.ADMIN_EMAIL ||
+        !process.env.ADMIN_PASSWORD ||
+        !secret()
+      ) {
+        return reply(503, {
+          error: "Не настроены переменные администратора"
         });
       }
 
-      const ok =
-        String(body.email || "").toLowerCase() === process.env.ADMIN_EMAIL.toLowerCase() &&
-        String(body.password || "") === process.env.ADMIN_PASSWORD;
+      const correct =
+        String(body.email || "").toLowerCase() ===
+          process.env.ADMIN_EMAIL.toLowerCase() &&
+        String(body.password || "") ===
+          process.env.ADMIN_PASSWORD;
 
-      if (!ok) return response(401, { error: "Неверные данные администратора" });
+      if (!correct) {
+        return reply(401, { error: "Неверные данные" });
+      }
 
-      return response(200, { ok: true }, issue({ role: "admin" }));
+      return reply(200, { ok: true }, setCookie({ role: "admin" }));
     }
 
     if (path === "logout") {
-      return response(200, { ok: true }, {
-        "Set-Cookie": cookie("", 0)
+      return reply(200, { ok: true }, {
+        "Set-Cookie": `${COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`
       });
     }
 
-    const session = readToken(event);
+    const session = getSession(event);
 
     if (path === "me") {
       if (!session || session.role !== "user") {
-        return response(401, { error: "Не авторизован" });
+        return reply(401, { error: "Не авторизован" });
       }
 
-      const u = (await allUsers()).find(x => x.id === session.uid);
-      if (!u) return response(401, { error: "Аккаунт не найден" });
+      const user = (await getUsers()).find(u => u.id === session.uid);
 
-      return response(200, { user: publicUser(u) });
+      if (!user) return reply(401, { error: "Пользователь не найден" });
+
+      return reply(200, { user: safeUser(user) });
     }
 
     if (["users", "grant", "revoke"].includes(path)) {
       if (!session || session.role !== "admin") {
-        return response(403, { error: "Только администратор" });
+        return reply(403, { error: "Нет доступа" });
       }
 
-      let users = await allUsers();
+      const users = await getUsers();
 
       if (path === "users") {
-        const q = String(event.queryStringParameters?.q || "").toLowerCase();
-        return response(200, {
-          users: users.filter(u => u.email.includes(q)).map(publicUser)
+        const q = String(
+          event.queryStringParameters?.q || ""
+        ).toLowerCase();
+
+        return reply(200, {
+          users: users
+            .filter(u => u.email.includes(q))
+            .map(safeUser)
         });
       }
 
       const email = String(body.email || "").trim().toLowerCase();
-      const u = users.find(x => x.email === email);
+      const user = users.find(u => u.email === email);
 
-      if (!u) return response(404, { error: "Пользователь не найден" });
+      if (!user) {
+        return reply(404, { error: "Пользователь не найден" });
+      }
 
       if (path === "revoke") {
-        u.entitlement = { plan: "free", expiresAt: null };
+        user.entitlement = {
+          plan: "free",
+          expiresAt: null
+        };
       } else {
-        const plan = ["premium", "full"].includes(body.plan) ? body.plan : null;
+        const plan = ["premium", "full"].includes(body.plan)
+          ? body.plan
+          : null;
+
         const days = String(body.days || "30");
 
         if (!plan || !["30", "90", "365", "lifetime"].includes(days)) {
-          return response(400, { error: "Некорректный тариф или срок" });
+          return reply(400, { error: "Некорректный тариф или срок" });
         }
 
-        u.entitlement = {
+        user.entitlement = {
           plan,
           expiresAt: days === "lifetime"
             ? "lifetime"
-            : new Date(Date.now() + Number(days) * 86400000).toISOString(),
+            : new Date(
+                Date.now() + Number(days) * 86400000
+              ).toISOString(),
           grantedAt: new Date().toISOString()
         };
       }
 
       await saveUsers(users);
-      return response(200, { user: publicUser(u) });
+
+      return reply(200, { user: safeUser(user) });
     }
 
-    return response(404, { error: "Маршрут не найден" });
-  } catch (e) {
-    console.error(e);
-    return response(500, { error: "Внутренняя ошибка сервера" });
+    return reply(404, { error: "Маршрут не найден" });
+
+  } catch (error) {
+    console.error(error);
+
+    return reply(500, {
+      error: "Внутренняя ошибка сервера"
+    });
   }
-}
+    }
